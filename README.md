@@ -7,3 +7,4 @@ Project dedicated for tuning Toyota Fortuner with Arduino setup.
 1. Indication of gas levels on dashboard
 2. Control and indication for auto-lights (requires DDA-65 sensor) 
 3. Control and indication for auto-wipers (requires DDA-65 sensor)
+4. OBD Emulation, GPS detection and HUD functionality (requires GPS sensor, HUD screen and CAN shield)
