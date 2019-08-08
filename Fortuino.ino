@@ -10,12 +10,23 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <stdarg.h>
-#include <time.h>
-// #include <mcp_can_dfs.h>
-// #include <mcp_can.h>
+#include <mcp_can_dfs.h>
+#include <mcp_can.h>
+#include <NeoGPS_cfg.h>
+#include <ublox/ubxGPS.h>
+#include <NeoTeeStream.h>
+#include <GPSport.h>
+#include <Streamers.h>
+
 #define INT32U unsigned long int
 INT32U canId = 0x000;
-#define VERSION "1.2.13"
+#define VERSION "1.3.4" 
+/** Change log: 
+ * + HUD Functionality has been added
+ * + Highway gauge is now enabled after 1 hour since fortuino start
+ * + During Dashboard initialization relays will not switch on. Will stay off until car is started.
+ * + HUD will not accept speed values to display if they are in difference more than 40 kmph and some other filtering condition
+ */
 #define DEBUG false
 
 // Pin assignments
@@ -26,7 +37,7 @@ const int GAS_LEVEL = A2;
 const int GAS_VALVE = A3;
 
 // Output - Digital
-const int AUTO_WIPER_RELAY = 6;
+const int AUTO_WIPER_RELAY = 2;
 const int FUEL_DASHBOARD_RELAY = 7;
 const int AUTO_LIGHT_RELAY = 8;
 
@@ -57,7 +68,7 @@ const float RESISTANCE_CORRECTION_STEP = 0.5;
 
 bool isGasValveOpen = false;
 const int AMOUNT_OF_MEASURES = 10;
-const float VOLTAGE_DEVIATION = 0; // Value in voltage with difference to what LPG controller shows. It might be easier to debug using the same values
+const float VOLTAGE_DEVIATION = -0.06; // Value in voltage with difference to what LPG controller shows. It might be easier to debug using the same values
 int gasValveCurrentMeasurement[AMOUNT_OF_MEASURES];
 int gasValveCurrentMeasurementArrayPointer = 0;
 
@@ -74,9 +85,10 @@ int gasLevelCurrentMeasurementArrayPointer = 0;
 // 130 Ohm, when it matches highway pattern. Defaults to 120 Ohm, as this is the main car mode.
 int MaxFuelGaugeResistance = 120;
 int gaugeResistanceSinceStart = 0;
-const int MAX_FUEL_GAUGE_RESISTANCE_HIGHWAY = 135;
+const int MAX_FUEL_GAUGE_RESISTANCE_HIGHWAY = 130;
 
 #define HIGHWAY_RESISTANCE_THRESHOLD 0.5 //%% of how much fuel should be consumed in 1 engine start before pattern of highway will be detected 
+#define HIGHWAY_TIME_THRESHOLD 3600000 // time in milliseconds since start when system should assume that car is on the highway
 #define STEP_RESISTANCE 1.6
 #define DIGIPOT_MINIMAL_RESISTANCE 10
 #define MAX_SENSOR_VALUE 5
@@ -92,16 +104,58 @@ boolean lightsAreOn = true; // Indicates if currently indicators are on
 
 /** CAN BUS Shield related settings **/
 
-#define CAN_500KBPS  16
-
 // Set control ping for shield to pin #10
 const int SPI_CS_PIN = 10;
-// MCP_CAN CAN(SPI_CS_PIN);
 
+/** GPS Receiver related settings **/
+// This is initial settings and are set in NeoGPS config files
+static const int RXPin = 4, TXPin = 6;
+static const uint32_t GPSBaud = 9600;
+
+NMEAGPS gps;
+Stream *both[2] = { &Serial, &gpsPort };
+NeoTeeStream tee( both, sizeof(both)/sizeof(both[0]) );
+static gps_fix  gps_data;
+uint8_t LastSentenceInInterval = 0xFF; // storage for the run-time selection
+const uint32_t COMMAND_DELAY = 250; // Delays when sending commands to GPS module
+static char lastChar; // last command char
+
+// Setting to set refresh rate to 10 Hz.
+const unsigned char ubxRate10Hz[] PROGMEM =
+  { 0x06,0x08,0x06,0x00,100,0x00,0x01,0x00,0x01,0x00 };
+const unsigned char ubxRate5Hz[] PROGMEM =
+  { 0x06,0x08,0x06,0x00,200,0x00,0x01,0x00,0x01,0x00 };
+
+
+// Setting baud rate to 38400
+const char baud38400 [] PROGMEM = "PUBX,41,1,3,3,38400,0";
+
+// Disable specific NMEA sentences
+const unsigned char ubxDisableGGA[] PROGMEM =
+  { 0x06,0x01,0x08,0x00,0xF0,0x00,0x00,0x00,0x00,0x00,0x00,0x01 };
+const unsigned char ubxDisableGLL[] PROGMEM =
+  { 0x06,0x01,0x08,0x00,0xF0,0x01,0x00,0x00,0x00,0x00,0x00,0x01 };
+const unsigned char ubxDisableGSA[] PROGMEM =
+  { 0x06,0x01,0x08,0x00,0xF0,0x02,0x00,0x00,0x00,0x00,0x00,0x01 };
+const unsigned char ubxDisableGSV[] PROGMEM =
+  { 0x06,0x01,0x08,0x00,0xF0,0x03,0x00,0x00,0x00,0x00,0x00,0x01 };
+const unsigned char ubxDisableRMC[] PROGMEM =
+  { 0x06,0x01,0x08,0x00,0xF0,0x04,0x00,0x00,0x00,0x00,0x00,0x01 };
+const unsigned char ubxDisableZDA[] PROGMEM =
+  { 0x06,0x01,0x08,0x00,0xF0,0x08,0x00,0x00,0x00,0x00,0x00,0x01 };
+
+unsigned int speedByGPS = 0;
+unsigned int previousSpeedByGPS = 0;
+
+/** Projectable HUD related settings **/
+MCP_CAN CAN(SPI_CS_PIN);
+
+const unsigned int SPEED_DIFFERENCE_THRESHOLD = 40;
+const unsigned int MAXIMUM_SPEED = 200;
 
 /** Scheduler related settings **/
 
-const int NUMBER_OF_SERVICES = 6;
+const int NUMBER_OF_SERVICES = 7;
 
 // 5 is number of services by index:
 #define GAS_VALVE_CHECKS 0
@@ -110,6 +164,7 @@ const int NUMBER_OF_SERVICES = 6;
 #define AUTO_LIGHT_CHECKS 3
 #define PROJECTABLE_HUD_UPDATES 4
 #define BLINKING_INDICATORS 5
+#define PROJECTABLE_HUD_UPDATES_GPS 6
 
 // Last timestamps when services were ran
 unsigned long lastRunTimes[NUMBER_OF_SERVICES] = {};
@@ -128,8 +183,25 @@ const int GAS_VALVE_CHECKS_HIGH_FREQUENCY_CHECKS = 100;
 // Timer when valve status is determined
 const int GAS_VALVE_CHECKS_LOW_FREQUENCY_CHECKS = 3000;
 
-int taskCooldowns[NUMBER_OF_SERVICES] = {GAS_VALVE_CHECKS_LOW_FREQUENCY_CHECKS, 100, 1000, 1000, 999999999999, 300};
-// int taskCooldowns[NUMBER_OF_SERVICES] = {99999999999999999, 99999999999999, 9999999999999, 999999999999, 1000};
+int taskCooldowns[NUMBER_OF_SERVICES] = {
+  GAS_VALVE_CHECKS_LOW_FREQUENCY_CHECKS, // GAS_VALVE_CHECKS
+  100, // GAS_CAPACITY_MEASUREMENT
+  1000, // AUTO_WIPER_CHECKS
+  1000, // AUTO_LIGHT_CHECKS
+  0, // PROJECTABLE_HUD_UPDATES
+  300, // BLINKING_INDICATORS
+  0 // PROJECTABLE_HUD_UPDATES_GPS
+};
+
+// int taskCooldowns[NUMBER_OF_SERVICES] = {
+//   99999999999999999, // GAS_VALVE_CHECKS
+//   99999999999999, // GAS_CAPACITY_MEASUREMENT
+//   9999999999999, // AUTO_WIPER_CHECKS
+//   999999999999, // AUTO_LIGHT_CHECKS
+//   999999999999, // PROJECTABLE_HUD_UPDATES
+//   99999999999, // BLINKING_INDICATORS
+//   1000 // PROJECTABLE_HUD_UPDATES_GPS
+// };
 
 // the setup routine runs once when you press reset:
 void setup() {
@@ -139,15 +211,15 @@ void setup() {
   initGasMeter();
   initAutoWiper();
   initAutoLight();
-  // initProjectableHUD();
+  initProjectableHUD();
 }
 
 void initGasMeter() {
 
-  // initialize serial communication at 9600 bits per second:
   Serial.print(F("Initializing potentiometr AD5206 ... "));
   pinMode(slaveSelectPin, OUTPUT);
   pinMode(FUEL_DASHBOARD_RELAY, OUTPUT);
+  digitalWrite(FUEL_DASHBOARD_RELAY, LOW);
   SPI.begin();
 
   Serial.println(F(" complete."));
@@ -169,14 +241,70 @@ void initAutoLight() {
 }
 
 void initProjectableHUD() {
-    // while (CAN_OK != CAN.begin(CAN_500KBPS))              // init can bus : baudrate = 500k
-    // {
-    //     Serial.println("CAN BUS Shield init fail");
-    //     Serial.println(" Init CAN BUS Shield again");
-    //     delay(100);
-    // }
-    // Serial.println("CAN BUS Shield init ok!");
+    initCanBusShield();
+    initGPSReceiver();
 }
+
+void initCanBusShield() {
+    while (CAN_OK != CAN.begin(MCP_ANY, CAN_1000KBPS, MCP_16MHZ))              // init can bus : baudrate = 500k
+    {
+        Serial.println("CAN BUS Shield init fail");
+        Serial.println(" Init CAN BUS Shield again");
+        delay(100);
+    }
+    CAN.setMode(MCP_NORMAL); // Set operation mode to normal so the MCP2515 sends acks to received data.
+    Serial.println("CAN BUS Shield init ok!");
+}
+
+void initGPSReceiver() {
+    say("GPS Receiver configuring: setting baud rate to 9600 and disabling all sentences except RMC and GLL. Serial type: %s", GPS_PORT_NAME);
+    gpsPort.begin();
+    // ss.begin(GPSBaud);
+    LastSentenceInInterval = NMEAGPS::NMEA_GLL;
+    //     changeBaud( baud38400, 38400UL );
+         sendUBX( ubxRate5Hz, sizeof(ubxRate5Hz) );
+          delay( COMMAND_DELAY );
+//        sendUBX( ubxDisableGLL, sizeof(ubxDisableGLL) );
+//          delay( COMMAND_DELAY );
+        sendUBX( ubxDisableGSV, sizeof(ubxDisableGSV) );
+          delay( COMMAND_DELAY );
+        sendUBX( ubxDisableGSA, sizeof(ubxDisableGSA) );
+          delay( COMMAND_DELAY );
+        sendUBX( ubxDisableGGA, sizeof(ubxDisableGGA) );
+          delay( COMMAND_DELAY );
+        sendUBX( ubxDisableZDA, sizeof(ubxDisableZDA) );
+
+    Serial.println("GPS Receiver initialized");
+}
+
+// void changeBaud( const char *textCommand, unsigned long baud )
+// {
+//   gps.send_P( &tee, (const __FlashStringHelper *) textCommand );
+//   gpsPort.flush();
+//   gpsPort.end();
+
+//   delay( 500 );
+//   gpsPort.begin( baud );
+
+// } // changeBaud
+
+void sendUBX( const unsigned char *progmemBytes, size_t len )
+{
+  gpsPort.write( 0xB5 ); // SYNC1
+  gpsPort.write( 0x62 ); // SYNC2
+
+  uint8_t a = 0, b = 0;
+  while (len-- > 0) {
+    uint8_t c = pgm_read_byte( progmemBytes++ );
+    a += c;
+    b += a;
+    gpsPort.write( c );
+  }
+
+  gpsPort.write( a ); // CHECKSUM A
+  gpsPort.write( b ); // CHECKSUM B
+
+} // sendUBX
 
 // the loop routine runs over and over again forever:
 void loop() {
@@ -227,9 +355,13 @@ void executeTasks()
           lastRunTimes[AUTO_LIGHT_CHECKS] = millis();
           doAutoLightChecks();
           break;
+        case PROJECTABLE_HUD_UPDATES_GPS:
+          lastRunTimes[PROJECTABLE_HUD_UPDATES_GPS] = millis();
+          doGPSDataReceive();
+          break;
         case PROJECTABLE_HUD_UPDATES:
           lastRunTimes[PROJECTABLE_HUD_UPDATES] = millis();
-//          doProjectableHUDUpdate();
+          doProjectableHUDUpdate();
           break;
         case BLINKING_INDICATORS:
           lastRunTimes[BLINKING_INDICATORS] = millis();
@@ -332,14 +464,14 @@ void doAutoWiperChecks() {
   if (autoWiperEnabled && autoWiperValue <= 200) {
     autoWiperEnabled = false;
     blinkingIndicators = false;
-    say("Turning auto wiper OFF");
+    Serial.println("Turning auto wiper OFF");
     digitalWrite(AUTO_WIPER_RELAY, LOW);
     digitalWrite(AUTO_WIPER_RELAY_INDICATOR, 0);
   }
 
   if (!autoWiperEnabled && autoWiperValue > 200) {
     autoWiperEnabled = true;
-    say("Turning auto wiper ON");
+    Serial.println("Turning auto wiper ON");
 
     // To turn this on, we need to make sure that auto light wire is turned on as well, otherwise DDA-65 block will be unpowered.
     doAutoLightChecks();
@@ -347,7 +479,7 @@ void doAutoWiperChecks() {
     // Wait for relays to powerup and DDA-65 to boot up. However ignore it when system has just started, cause 
     // this is the way how the sensor is designed.
     if (millis() > 5000) {
-      say("Switching blinking OFF");
+      Serial.println("Switching blinking OFF");
       blinkingIndicators = false;
       if (!lightsAreOn) {
         doBlinkIndicators();
@@ -383,86 +515,158 @@ void doAutoLightChecks() {
 
   if (autoLightEnabled && autoLightValue <= 200) {
     autoLightEnabled = false;
-    say("Turning auto light sensor OFF.");
+    Serial.println("Turning auto light sensor OFF.");
     digitalWrite(AUTO_LIGHT_RELAY, LOW);
     digitalWrite(AUTO_LIGHT_RELAY_INDICATOR, 0);
   }
 
   if (!autoLightEnabled && (autoLightValue > 200 || autoWiperEnabled)) {
     autoLightEnabled = true;
-    say("Turning auto light sensor ON.");
+    Serial.println("Turning auto light sensor ON.");
     digitalWrite(AUTO_LIGHT_RELAY, HIGH);
     analogWrite(AUTO_LIGHT_RELAY_INDICATOR, round(INDICATOR_VOLTAGE*0.2)); // 80% of indicator value, cause otherwise it's too bright
   }
 
 }
+
+void doGPSDataReceive() {
+
+  while (gps.available(gpsPort)) {
+    gps_data = gps.read();
+   if (gps_data.valid.time) {
+      speedByGPS = round(gps_data.speed_kph());
+
+      if (DEBUG) {
+        Serial.print(gps_data.speed_kph());
+        Serial.print( '>' );
+        Serial.print(gps_data.dateTime_ms());
+        Serial.print( '>' );
+        Serial.print(gps_data.latitude());
+        Serial.print( ',' );
+        Serial.print(gps_data.longitude());
+        Serial.print( '>' );
+        Serial.print(gps_data.dateTime.minutes);
+        Serial.print( ':' );
+        Serial.print(gps_data.dateTime.seconds);
+        Serial.print( '.' );
+        Serial.print(gps_data.dateTime_cs);
+        Serial.print( '*' );
+        Serial.print(gps_data.valid.speed);
+        Serial.println("");
+      }
+   } 
+  }
+}
+
 void doProjectableHUDUpdate() {
-//    unsigned char stmp[8] = {4, 65, 13, 120, 224, 185, 147};
-//   // // send data:  id = 0x00, standrad frame, data len = 1, stmp: data buf  
-//      //int speed = random(120,150);
-//      say("Seeting speed to: %d", stmp);
-//      CAN.sendMsgBuf(0x00, 0, 7, stmp);
-//   return;
 
-// String BuildMessage="";
+  if (DEBUG && speedByGPS != previousSpeedByGPS) {
+    say("Setting speed to %d km/h", speedByGPS);
+  }
+
+  // Do filtering for absent speed from GPS receiver and filter out jumps from 0 to high speed to due serial bus errors
+  int speedDifference = previousSpeedByGPS - speedByGPS;
+  if (
+    abs(speedDifference) < SPEED_DIFFERENCE_THRESHOLD
+    || (!previousSpeedByGPS && speedByGPS && speedByGPS < MAXIMUM_SPEED) // There are cases when GPS receiver can provide you wrong values while you're driving between 0-40 kph. After which you will stuck with 0 value until speed is dropped lower, which is not very comfortable on a highway.
+    ) {
+    previousSpeedByGPS = speedByGPS;
+  }
+
+  unsigned char len = 0;
+  unsigned char buf[8];
+
+        // Define the set of PIDs you wish you ECU to support.  For more information, see:
+        // https://en.wikipedia.org/wiki/OBD-II_PIDs#Mode_1_PID_00
+        // For this sample, we are only supporting the following PIDs
+        // PID (HEX)  PID (DEC)  DESCRIPTION
+        // ---------  ---------  --------------------------
+        //      0x15         05  Engine Coolant Temperature
+        //      0x0C         12  Engine RPM
+        //      0x0D         13  Speed
+
+        // As per the information on bitwise encoded PIDs (https://en.wikipedia.org/wiki/OBD-II_PIDs#Mode_1_PID_00)
+        // Our supported PID value is: 
+        //     PID 0x05 (05) - Engine Coolant Temperature
+        //     |      PID 0x0C (12) - Engine RPM
+        //     |      |PID 0x10 (13) - Speed
+        //     |      ||
+        //     V      VV
+        // 00001000000110000000000000000000
+        // Converted to hex, that is the following four byte value
+        // 0x08180000
+
+        
+        // Of course, if you want your ECU simulator to be able to respond to any PID From 0x00 to 0x20, you can just use the following PID Bit mask
+        // 11111111111111111111111111111111
+        // Or 
+        // 0xFFFFFFFF
+
+        // Next, we'll create the bytearray that will be the Supported PID query response data payload using the four bye supported pi hex value
+        // we determined above (0x08110000):
+        
+        //                      0x06 - additional meaningful bytes after this one (1 byte Service Mode, 1 byte PID we are sending, and the four by Supported PID value)
+        //                       |    0x41 - This is a response (0x40) to a service mode 1 (0x01) query.  0x40 + 0x01 = 0x41
+        //                       |     |    0x00 - The response is for PID 0x00 (Supported PIDS 1-20)
+        //                       |     |     |    0x08 - The first of four bytes of the Supported PIDS value
+        //                       |     |     |     |    0x11 - The second of four bytes of the Supported PIDS value
+        //                       |     |     |     |     |    0x00 - The third of four bytes of the Supported PIDS value
+        //                       |     |     |     |     |      |   0x00 - The fourth of four bytes of the Supported PIDS value
+        //                       |     |     |     |     |      |    |    0x00 - OPTIONAL - Just extra zeros to fill up the 8 byte CAN message data payload)
+        //                       |     |     |     |     |      |    |     |
+        //                       V     V     V     V     V      V    V     V 
 
 
-// unsigned char len = 0;
-// unsigned char buf[8];
-// char str[20];
-//       char rndCoolantTemp=random(1,200);
-//     char rndRPM=random(1,55);
-//     char rndSpeed=random(0,255);
-//     char rndIAT=random(0,255);
-//     char rndMAF=random(0,255);
-//     char rndAmbientAirTemp=random(0,200);
-//     char rndCAT1Temp=random(1,55);
+     byte SupportedPID[8] = {0x06, 0x41, 0x00, 0x08, 0x18, 0x00, 0x00, 0x00};
+     String canMessageRead="";
+
+    //SENSORS
+    byte ect         = 500;   //Indicates temperature. This setting is 80 degrees.
+    unsigned int rpm = 20; //Indicates RPM. This setting will set it to 1200.
+    unsigned int speed = previousSpeedByGPS; //Speed seeting
+
+    // Conversion to hexed values
+    byte ectSensor[8] = {3, 65, 0x05, 120, 224, 185, 147};
+    byte rpmSensor[8] = {4, 65, 12, rpm, 224, 185, 147};
+    byte speedSensor[8] = {4, 65, 13, speed, 224, 185, 147};
     
-//     //GENERAL ROUTINE
-//     unsigned char SupportedPID[8] =       {1,2,3,4,5,6,7,8};
-//     unsigned char MilCleared[7] =         {4, 65, 63, 34, 224, 185, 147}; 
-    
-//     //SENSORS
-//     unsigned char CoolantTemp[7] =        {4, 65, 5, rndCoolantTemp, 0, 185, 147};  
-//     unsigned char rpm[7] =                {4, 65, 12, rndRPM, 224, 185, 147};
-//     unsigned char vspeed[7] =             {4, 65, 13, rndSpeed, 224, 185, 147};
-//     unsigned char IATSensor[7] =          {4, 65, 15, rndIAT, 0, 185, 147};
-//     unsigned char MAFSensor[7] =          {4, 65, 16, rndMAF, 0, 185, 147};
-//     unsigned char AmbientAirTemp[7] =     {4, 65, 70, rndAmbientAirTemp, 0, 185, 147};
-//     unsigned char CAT1Temp[7] =           {4, 65, 60, rndCAT1Temp, 224, 185, 147};
-//     unsigned char CAT2Temp[7] =           {4, 65, 61, rndCAT1Temp, 224, 185, 147};
-//     unsigned char CAT3Temp[7] =           {4, 65, 62, rndCAT1Temp, 224, 185, 147};
-//     unsigned char CAT4Temp[7] =           {4, 65, 63, rndCAT1Temp, 224, 185, 147};
-    
-//     if(CAN_MSGAVAIL == CAN.checkReceive())  
-//     {
+
+
+    if(CAN_MSGAVAIL == CAN.checkReceive()) 
+    //if (!digitalRead(CAN_INT))
+    {
       
-//       CAN.readMsgBuf(&len, buf); 
-//         canId = CAN.getCanId();
-//         Serial.print("<");Serial.print(canId);Serial.print(",");
-//         for(int i = 0; i<len; i++)
-//         {  
-//           BuildMessage = BuildMessage + buf[i] + ",";
-//         }
-//         Serial.println(BuildMessage);
+        CAN.readMsgBuf(&canId, &len, buf); 
+        // FROM: https://en.wikipedia.org/wiki/OBD-II_PIDs#CAN_(11-bit)_bus_format
+        // A CANId value of 0x7DF indicates a query from a diagnostic reader, which acts as a broadcast address and accepts
+        // responses from any ID in the range 0x7E8 to 0x7EF.  ECUs that can respond to OBD queries listen both to the functional 
+        // broadcast ID of 0x7DF and one assigned in the range 0x7E0 to 0x&7E7.  Their response has an ID of their assigned ID
+        // plus 8 (e.g. 0x7E8 through 0x7EF).  Typically, the main ECU responds on 0x7E8.
+
+        if (DEBUG) {
+          Serial.print("<<");Serial.print(canId,HEX);Serial.print(",");
+        }
+
+        for(int i = 0; i<len; i++)
+        {  
+          canMessageRead = canMessageRead + buf[i] + ",";
+        }
+
+        if (DEBUG) {
+          Serial.println(canMessageRead);
+        }
         
-//         //Check wich message was received.
-//         if(BuildMessage=="2,1,0,0,0,0,0,0,") {CAN.sendMsgBuf(0x7E8, 0, 8, SupportedPID);}
-//         if(BuildMessage=="2,1,1,0,0,0,0,0,") {CAN.sendMsgBuf(0x7E8, 0, 7, MilCleared);}
+        // This is PID request ID. We should respond with supported PIDs.
+        if(canMessageRead=="2,1,0,0,0,0,0,0,") {CAN.sendMsgBuf(0x7E8, 0, 8, SupportedPID);}
         
-//         //SEND SENSOR STATUSES
-//         if(BuildMessage=="2,1,5,0,0,0,0,0,") {CAN.sendMsgBuf(0x7E8, 0, 7, CoolantTemp);}
-//         if(BuildMessage=="2,1,12,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 7, rpm);}
-//         if(BuildMessage=="2,1,13,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 7, vspeed);}
-//         if(BuildMessage=="2,1,15,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 7, IATSensor);}
-//         if(BuildMessage=="2,1,16,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 7, MAFSensor);}
-//         if(BuildMessage=="2,1,70,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 7, AmbientAirTemp);}
-//         if(BuildMessage=="2,1,60,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 7, CAT1Temp);}
-//         if(BuildMessage=="2,1,61,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 7, CAT2Temp);}
-//         if(BuildMessage=="2,1,62,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 7, CAT3Temp);}
-//         if(BuildMessage=="2,1,63,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 7, CAT4Temp);}
-//         BuildMessage="";
-//     }
+        //SEND SENSOR STATUSES
+        if(canMessageRead=="2,1,5,0,0,0,0,0,")  {CAN.sendMsgBuf(0x7E8, 0, 8, ectSensor);}
+        if(canMessageRead=="2,1,12,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 8, rpmSensor);}
+        if(canMessageRead=="2,1,13,0,0,0,0,0,"){CAN.sendMsgBuf(0x7E8, 0, 8, speedSensor);}
+
+        canMessageRead="";
+    } 
+    
 }
 
 void doBlinkIndicators() {
@@ -627,7 +831,10 @@ void adjustGaugeResistanceBasedOnSpentFuel(int resistance) {
     return;
   }
 
-  if ((gaugeResistanceSinceStart - resistance) >= MaxFuelGaugeResistance*HIGHWAY_RESISTANCE_THRESHOLD) {
+  if (
+    (gaugeResistanceSinceStart - resistance) >= MaxFuelGaugeResistance*HIGHWAY_RESISTANCE_THRESHOLD
+    || millis() > HIGHWAY_TIME_THRESHOLD
+    ) {
     MaxFuelGaugeResistance = MAX_FUEL_GAUGE_RESISTANCE_HIGHWAY;
     say("Highway pattern of fuel use detected: was: %d now: %d. Setting maximum gauge resistance to %d Ohm", gaugeResistanceSinceStart, resistance, MaxFuelGaugeResistance);
     return;
