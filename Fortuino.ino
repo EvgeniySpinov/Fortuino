@@ -440,7 +440,7 @@ void doGasCapacityMeasurement() {
   // Next loop will use new gauge resistance if it was changed here.
   adjustGaugeResistanceBasedOnSpentFuel(resistance);
 
-  say("Setting step of digipot to: %d Ohms. Max resistance is: %d", resistance, MaxFuelGaugeResistance);
+  say("Setting step of digipot to: %d Ohms. Max resistance is: %d. Voltage on sensor: %f V", resistance, MaxFuelGaugeResistance, gasLevelInVolts);
   setResistance(resistance);
 }
 
