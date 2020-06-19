@@ -20,8 +20,13 @@
 
 #define INT32U unsigned long int
 INT32U canId = 0x000;
-#define VERSION "1.3.4" 
+#define VERSION "1.3.5" 
 /** Change log: 
+ * 
+ * Version 1.3.5
+ * * Fixed issue when switching off wiper, auto-lights indicator might get left off, while switch is on.
+ * 
+ * Vesion 1.3.4
  * + HUD Functionality has been added
  * + Highway gauge is now enabled after 1 hour since fortuino start
  * + During Dashboard initialization relays will not switch on. Will stay off until car is started.
@@ -464,6 +469,11 @@ void doAutoWiperChecks() {
   if (autoWiperEnabled && autoWiperValue <= 200) {
     autoWiperEnabled = false;
     blinkingIndicators = false;
+
+    // Check if indicators left in proper state after blinking
+    if (!lightsAreOn) {
+      doBlinkIndicators();
+    }
     Serial.println("Turning auto wiper OFF");
     digitalWrite(AUTO_WIPER_RELAY, LOW);
     digitalWrite(AUTO_WIPER_RELAY_INDICATOR, 0);
