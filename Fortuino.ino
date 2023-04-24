@@ -3,8 +3,9 @@
     - Installed gas equipment is showing gas level in separate indicator inside the car
     - Native gauge of gasoline becomes useless, since car is mostly used on gas and not benzine
     - It would be nice to show level of gas, instead of level of benzine, when car is working on gas and show benzine level, when car switching to benzine.
-    - Bingo, this code is exactly to solve this problem
-
+    - It manages control and indication for auto-lights (requires DDA-65 sensor)
+    - Control and indication for auto-wipers (requires DDA-65 sensor)
+    - OBD Emulation, GPS detection and HUD functionality (requires GPS sensor, HUD screen and CAN shield)
 */
 
 #include <Arduino.h>
@@ -20,8 +21,26 @@
 
 #define INT32U unsigned long int
 INT32U canId = 0x000;
-#define VERSION "1.3.5" 
+#define VERSION "1.3.10" 
 /** Change log: 
+ * 
+ * Version 1.3.10
+ * * Changed threshold for applying corrections to fuel level adjustmenets based on switched on Auto lights and Auto wipers. Now 
+ *   those corrections apply at 50% of tank level, instead of 75%.
+ * * Since debugging of LPG has grown in size and when enabled solution doesn't fit into Arduino memory anymore, separation of few sections has
+ *   been introduced: LPG_LEVELS, LPG_REST, which splits those debugging options apart
+ * 
+ * Version 1.3.9
+ * * Adjusting threshold for valve detection as it still flip flops and this cannot be detected with connected USB
+ * 
+ * Version 1.3.8
+ * * Introduced spare debugging capabilities for each of the sections instead of general DEBUG variable
+ * 
+ * Version 1.3.7
+ * * Raised threshold for gas valve detection. As it was flip flopping on idle engine
+ * 
+ * Version 1.3.6
+ * * Removed delay for wiper switch on, which caused HUD to fail
  * 
  * Version 1.3.5
  * * Fixed issue when switching off wiper, auto-lights indicator might get left off, while switch is on.
@@ -32,8 +51,11 @@ INT32U canId = 0x000;
  * + During Dashboard initialization relays will not switch on. Will stay off until car is started.
  * + HUD will not accept speed values to display if they are in difference more than 40 kmph and some other filtering condition
  */
-#define DEBUG false
-
+#define DEBUG_GPS false
+#define DEBUG_SENSORS false
+#define DEBUG_LPG_LEVELS false
+#define DEBUG_LPG_REST false
+#define DEBUG_LPG_TURN_VALVE_ON false
 // Pin assignments
 // Input - Analog
 const int AUTO_LIGHT = A0;
@@ -212,7 +234,7 @@ int taskCooldowns[NUMBER_OF_SERVICES] = {
 void setup() {
   Serial.begin(115200);
   Serial.println();
-  say("Entering initialization stage. Fortuino version: %s. Debug is %s", VERSION, (DEBUG ? "ON" : "OFF"));
+  say("Entering initialization stage. Fortuino version: %s. Debug is %s", VERSION, (DEBUG_GPS || DEBUG_LPG_LEVELS || DEBUG_LPG_REST || DEBUG_SENSORS || DEBUG_LPG_TURN_VALVE_ON ? "ON" : "OFF"));
   initGasMeter();
   initAutoWiper();
   initAutoLight();
@@ -385,7 +407,7 @@ void doGasCapacityMeasurement() {
   int sensorValue = analogRead(GAS_LEVEL);
   
   // print out the value you read:
-  if (DEBUG) {
+  if (DEBUG_LPG_LEVELS) {
     say("Read voltage from A2 pin which represents gas level: %d bits", sensorValue);
   }
 
@@ -401,7 +423,7 @@ void doGasCapacityMeasurement() {
   float gasLevelMean = calculateMean(gasLevelCurrentMeasurement, AMOUNT_OF_MEASURES);
   float gasLevelInVolts = ((gasLevelMean * 5) / 1024) + VOLTAGE_DEVIATION; // Also apply correction of voltage here
 
-  if (DEBUG) {
+  if (DEBUG_LPG_LEVELS) {
     say("Read voltage from A2 pin which represents gas level in V: %f, mean was %f", gasLevelInVolts, gasLevelMean);
   }
 
@@ -453,7 +475,7 @@ void doAutoWiperChecks() {
   int autoWiperValue = analogRead(AUTO_WIPER);
 
   // print out the value you read:
-  if (DEBUG) {
+  if (DEBUG_SENSORS) {
     say("Read voltage from Auto Wiper checks pin: %d bits", autoWiperValue);
   }
 
@@ -483,6 +505,8 @@ void doAutoWiperChecks() {
     autoWiperEnabled = true;
     Serial.println("Turning auto wiper ON");
 
+    bool previousStateOfLights = autoLightEnabled;
+
     // To turn this on, we need to make sure that auto light wire is turned on as well, otherwise DDA-65 block will be unpowered.
     doAutoLightChecks();
 
@@ -494,7 +518,13 @@ void doAutoWiperChecks() {
       if (!lightsAreOn) {
         doBlinkIndicators();
       }
-      delay(1000);
+
+      // If wipers were enabled without autolights - delay of 1 second needs to be made, otherwise DDA-65 will enter setup mode. This will break HUD display, however 
+      // working this around would require effort (needs to be done via scheduler), but will occur in very rare cases.
+      if (!previousStateOfLights) {
+        delay(1000);
+      }
+
     } else {
       blinkingIndicators = true;
       say("Both of switches are on, so blinking is enabled");
@@ -508,7 +538,7 @@ void doAutoLightChecks() {
   int autoLightValue = analogRead(AUTO_LIGHT);
 
   // print out the value you read:
-  if (DEBUG) {
+  if (DEBUG_SENSORS) {
     say("Read voltage from Auto light checks pin: %d bits", autoLightValue);
   }
 
@@ -546,7 +576,7 @@ void doGPSDataReceive() {
    if (gps_data.valid.time) {
       speedByGPS = round(gps_data.speed_kph());
 
-      if (DEBUG) {
+      if (DEBUG_GPS) {
         Serial.print(gps_data.speed_kph());
         Serial.print( '>' );
         Serial.print(gps_data.dateTime_ms());
@@ -570,7 +600,7 @@ void doGPSDataReceive() {
 
 void doProjectableHUDUpdate() {
 
-  if (DEBUG && speedByGPS != previousSpeedByGPS) {
+  if (DEBUG_GPS && speedByGPS != previousSpeedByGPS) {
     say("Setting speed to %d km/h", speedByGPS);
   }
 
@@ -653,7 +683,7 @@ void doProjectableHUDUpdate() {
         // broadcast ID of 0x7DF and one assigned in the range 0x7E0 to 0x&7E7.  Their response has an ID of their assigned ID
         // plus 8 (e.g. 0x7E8 through 0x7EF).  Typically, the main ECU responds on 0x7E8.
 
-        if (DEBUG) {
+        if (DEBUG_GPS) {
           Serial.print("<<");Serial.print(canId,HEX);Serial.print(",");
         }
 
@@ -662,7 +692,7 @@ void doProjectableHUDUpdate() {
           canMessageRead = canMessageRead + buf[i] + ",";
         }
 
-        if (DEBUG) {
+        if (DEBUG_GPS) {
           Serial.println(canMessageRead);
         }
         
@@ -694,14 +724,14 @@ void doBlinkIndicators() {
 // My instance of AD5206 has damaged 2nd channel. So I had to adjust code for this.
 void setResistance(int resistance) {
 
-  // Adding correction of resistance here, however only after we reach less than 25% of tank capacity, otherwise
+  // Adding correction of resistance here, however only after we reach less than 50% of tank capacity, otherwise
   // fuel levels are quickly decreasing in beginning and then very slowly in the end.
   resistanceCorrection = 0;
-  if (autoLightEnabled && resistance > round(MaxFuelGaugeResistance*0.75)) {
+  if (autoLightEnabled && resistance > round(MaxFuelGaugeResistance*0.50)) {
     resistanceCorrection += round(resistance*RESISTANCE_CORRECTION_STEP);
   }
 
-  if (autoWiperEnabled && resistance > round(MaxFuelGaugeResistance*0.75)) {
+  if (autoWiperEnabled && resistance > round(MaxFuelGaugeResistance*0.50)) {
     resistanceCorrection += round(MaxFuelGaugeResistance*RESISTANCE_CORRECTION_STEP);
   }
 
@@ -721,7 +751,7 @@ void setResistance(int resistance) {
   gasLevelResistanceStepSetPreviously = step;
   int levelPerChannel = floor(step/(NUMBER_OF_CHANNELS_IN_DIGIPOT - NUMBER_OF_DEFECTIVE_CHANNELS_IN_DIGIPOT));
   int leftOvers = step - levelPerChannel*(NUMBER_OF_CHANNELS_IN_DIGIPOT - NUMBER_OF_DEFECTIVE_CHANNELS_IN_DIGIPOT);
-  if (DEBUG) {
+  if (DEBUG_LPG_LEVELS) {
     say("Level per channel identified: %d. Leftovers: %d. Resistance is set to: %d", levelPerChannel, leftOvers, resistance);
   }  
   for (int channel = 0; channel < NUMBER_OF_CHANNELS_IN_DIGIPOT; channel++) {
@@ -733,13 +763,13 @@ void setResistance(int resistance) {
     
     if (leftOvers) {
       digitalPotWrite(channel, levelPerChannel + 1);
-      if (DEBUG) {
+      if (DEBUG_LPG_LEVELS) {
         say("Setting %d channel to step %d", channel, levelPerChannel + 1);
       }
       leftOvers--;
     } else {
       digitalPotWrite(channel, levelPerChannel);
-      if (DEBUG) {
+      if (DEBUG_LPG_LEVELS) {
         say("Setting %d channel to step %d", channel, levelPerChannel);
       }
     }
@@ -750,11 +780,11 @@ void updateGasValveOpen() {
 
   // Do initial reading. If it's 0 (for example gas equipment is off), do not run through other cycles
   int currentValveState = analogRead(GAS_VALVE);
-  if (DEBUG) {
+  if (DEBUG_LPG_TURN_VALVE_ON) {
     currentValveState = 500;
   }
 
-  if (DEBUG) {
+  if (DEBUG_LPG_REST) {
     say("Read voltage from A3 pin which represents gas valve state: %d bits", currentValveState);
   }
 
@@ -780,11 +810,11 @@ void updateGasValveOpen() {
   if (gasValveCurrentMeasurementArrayPointer == AMOUNT_OF_MEASURES) {
     float standardDeviation = calculateSD(gasValveCurrentMeasurement, AMOUNT_OF_MEASURES);
 
-    if (DEBUG) {
+    if (DEBUG_LPG_REST) {
       say("Standard deviation: %f", standardDeviation);
     }
 
-    if (standardDeviation < 40) {
+    if (standardDeviation < 100) {
       setDashboardSource(true);
     } else {
       setDashboardSource(false);
@@ -804,7 +834,7 @@ void setDashboardSource(bool state) {
     return;
   }
 
-  if (DEBUG) {
+  if (DEBUG_LPG_REST) {
     say("Entering function of setting fuel measurement source with request to set state %d", state);
   }
 
@@ -835,7 +865,7 @@ void adjustGaugeResistanceBasedOnSpentFuel(int resistance) {
   // We set gauge resistance since start after 20 seconds of device boot
   if (!gaugeResistanceSinceStart && millis() > 20000) {
     gaugeResistanceSinceStart = resistance;
-    if (DEBUG) {
+    if (DEBUG_LPG_LEVELS) {
       say("Setting resistance since start is %d, while resistance is %d", gaugeResistanceSinceStart, resistance);
     }
     return;
